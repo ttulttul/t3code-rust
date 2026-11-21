@@ -347,7 +347,7 @@ impl Store {
                     if let Some(run) = t.runs.iter_mut().find(|r| r.id == *run_id) {
                         run.status = status.clone();
                         run.error = error.clone();
-                        run.finished_at = Some(now());
+                        run.finished_at = Some(at);
                     }
                 }
             }
@@ -430,4 +430,64 @@ pub(crate) fn wire_project(p: &Project) -> serde_json::Value {
             .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
     );
     serde_json::json!({"id":p.id,"title":p.name,"hasCustomTitle":false,"workspaceRoot":p.path,"repositoryIdentity":null,"faviconPath":null,"projectIcon":null,"defaultModelSelection":null,"defaultThreadEnvMode":null,"autoPull":false,"scripts":[],"pinnedAt":null,"archivedAt":null,"createdAt":at,"updatedAt":at,"deletedAt":null})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_finished_run_ends_when_its_record_was_committed() {
+        // Live subscribers are sent what a commit changes, worked out on a
+        // copy of the thread before the store applies it; and a restart
+        // replays the log. Both need the record alone to decide the run's
+        // end, not the clock when it is applied.
+        let run_id = Uuid::new_v4();
+        let mut store = Store::default();
+        store.threads.insert(
+            "t1".into(),
+            Thread {
+                row: json!({}),
+                id: "t1".into(),
+                project_id: "p1".into(),
+                title: "T".into(),
+                cwd: "/w".into(),
+                status: "running".into(),
+                messages: vec![],
+                runs: vec![serde_json::from_value(json!({
+                    "id": run_id,
+                    "thread_id": "t1",
+                    "provider": "codex",
+                    "status": "running",
+                    "started_at": 1,
+                    "finished_at": null,
+                    "error": null,
+                }))
+                .expect("a run")],
+                created_at: 1,
+                archived: false,
+                settled: false,
+                snoozed_until: None,
+                pinned: false,
+                unread: false,
+                tags: vec![],
+                checkpoints: vec![],
+                provider: Box::default(),
+            },
+        );
+        store.apply_record(&ServerEvent {
+            id: 1,
+            at: 7,
+            event: Event::RunFinished {
+                run_id,
+                thread_id: "t1".into(),
+                status: "completed".into(),
+                error: None,
+            },
+            receipt: None,
+            thread_events: None,
+        });
+        assert_eq!(store.threads["t1"].runs[0].finished_at, Some(7));
+    }
 }
