@@ -28,7 +28,15 @@ turn, provider thread and provider session states. Scenarios with runtime
 requests set the thread's runtime mode and answer (`respond`) or interrupt the
 first request once its card shows; the `cli approvals` check compares what each
 server told the fake CLI: the runtime policy of its thread and turn, and its
-answer to each request. Known differences are listed
+answer to each request.
+
+Restart scenarios (those with "restart") stop the server the way a service
+manager does (SIGTERM) once the turn is running or has settled, change what
+the scenario says (settings, or the CLI removed), start the server again on the
+same home, wait for whatever it continues to settle, and then compare the
+thread: how the cut-off run ended, the notice and the continuation run, the
+provider session, and each turn launch of the CLI (`cli launches`: a new
+session or a resumed one). Known differences are listed
 in client_thread_parity_xfail.json; an entry that starts matching fails the
 suite until it is removed.
 """
@@ -89,6 +97,19 @@ PROVIDER_SCENARIOS = [
      "scenario": "claude_approval.json", "runtimeMode": "approval-required", "respond": {"decision": "acceptForSession"}},
     {"name": "claude auto-accept-edits", "instance": "claudeAgent", "model": "claude-opus-5-5",
      "scenario": "claude_approval.json", "runtimeMode": "auto-accept-edits", "respond": {"decision": "cancel"}},
+    # Server restarts: the reference's ProviderRuntimeRecoveryService and restart continuation.
+    {"name": "claude restart mid-turn", "instance": "claudeAgent", "model": "claude-opus-5-5",
+     "scenario": "claude_restart.json", "restart": {"after": "running"}},
+    {"name": "claude restart idle", "instance": "claudeAgent", "model": "claude-opus-5-5",
+     "scenario": "claude_restart_idle.json", "restart": {"after": "settled"}},
+    {"name": "claude restart continuation off", "instance": "claudeAgent", "model": "claude-opus-5-5",
+     "scenario": "claude_restart.json",
+     "restart": {"after": "running", "settings": {"continueThreadsAfterServerUpdate": False}}},
+    {"name": "claude restart instance disabled", "instance": "claudeAgent", "model": "claude-opus-5-5",
+     "scenario": "claude_restart.json", "restart": {"after": "running", "settings": {
+         "providerInstances": {"claudeAgent": {"driver": "claudeAgent", "enabled": False}}}}},
+    {"name": "claude restart cli missing", "instance": "claudeAgent", "model": "claude-opus-5-5",
+     "scenario": "claude_restart.json", "restart": {"after": "running", "removeCli": True}},
 ]
 # The fake CLIs: version probes answer as a supported release would, and protocol sessions replay
 # the scenario. Anything else exits quietly.
@@ -447,6 +468,71 @@ def cli_launch(log, root):
     return out
 
 
+def turn_launches(log):
+    """Each turn launch of a fake CLI, in order: a new session, or one it resumes. Claude Code
+    resumes with --resume; Codex with thread/resume."""
+    out = []
+    launch = Path(str(log) + ".launch")
+    for line in (launch.read_text().splitlines() if launch.exists() else []):
+        argv = json.loads(line)["argv"]
+        if "--no-session-persistence" in argv or argv[:1] == ["app-server"]:
+            continue
+        out.append("resume" if any(arg.startswith("--resume") for arg in argv) else "new")
+    for line in (Path(log).read_text().splitlines() if Path(log).exists() else []):
+        with contextlib.suppress(ValueError):
+            method = json.loads(line).get("method")
+            if method in ("thread/start", "thread/resume"):
+                out.append("resume" if method == "thread/resume" else "new")
+    return out
+
+
+def thread_projection(url, cookie):
+    return rpc(url, cookie, "orchestration.getThreadProjection", {"threadId": THREAD})
+
+
+ACTIVE_RUN = {"preparing", "starting", "running", "waiting"}
+
+
+def wait_for(url, cookie, done, seconds):
+    deadline = time.monotonic() + seconds
+    while True:
+        projection = thread_projection(url, cookie)
+        if done(projection) or time.monotonic() > deadline:
+            return projection
+        time.sleep(0.5)
+
+
+def restart_turn(args, command, root, credentials, env, checkouts, fake_bin, scenario):
+    """A turn on a server that is stopped and started again: what the client sees afterwards."""
+    restart = scenario["restart"]
+    with contextlib.ExitStack() as first:
+        url, cookie = managed_server(first, command, root, *credentials, env=env)
+        seeded = seed_turn(url, cookie, checkouts, scenario)
+        rpc(url, cookie, "orchestration.dispatchCommand", seeded["dispatch"])
+        if restart["after"] == "running":
+            # The turn has run a command and holds on.
+            wait_for(url, cookie, lambda p: any(i.get("type") == "command_execution"
+                                                for i in p.get("turnItems", [])), 30)
+        else:
+            wait_for(url, cookie, lambda p: bool(p.get("runs")) and not any(
+                r.get("status") in ACTIVE_RUN for r in p["runs"]), 30)
+        time.sleep(1)
+        if restart.get("settings"):
+            rpc(url, cookie, "server.updateSettings", {"patch": restart["settings"]})
+    # Stopped as a service manager stops it.
+    if restart.get("removeCli"):
+        for cli in fake_bin.iterdir():
+            cli.unlink()
+    with contextlib.ExitStack() as second:
+        url, cookie = managed_server(second, command, root, *credentials, env=env)
+        # The reference continues a turn a few seconds after it starts; let that run settle.
+        started = time.monotonic()
+        wait_for(url, cookie, lambda p: time.monotonic() - started > 8 and not any(
+            r.get("status") in ACTIVE_RUN for r in p.get("runs", [])), 40)
+        time.sleep(1)
+        return run_client(args, url, cookie, {"threadId": THREAD, "inspect": True})
+
+
 def compare_turn(original, rust):
     """Problems with Rust's provider turn as the reference client sees it, by check name."""
     problems = {}
@@ -456,18 +542,25 @@ def compare_turn(original, rust):
     cli = [original.get("cli", []), rust.get("cli", [])]
     if cli[0] != cli[1]:
         problems["cli approvals"] = [f"original {line}" for line in cli[0]] + [f"rust     {line}" for line in cli[1]]
+    launches = [original.get("launches", []), rust.get("launches", [])]
+    if launches[0] != launches[1]:
+        problems["cli launches"] = [f"original {launches[0]}", f"rust     {launches[1]}"]
     failed_steps = False
-    for step in ("orchestration.subscribeThread (live turn)", "orchestration.subscribeThread",
-                 "orchestration.getThreadProjection"):
+    live_step = "orchestration.subscribeThread (live turn)"
+    inspected = live_step not in original["steps"] and live_step not in rust["steps"]
+    for step in ((() if inspected else (live_step,))
+                 + ("orchestration.subscribeThread", "orchestration.getThreadProjection")):
         a, b = original["steps"].get(step), rust["steps"].get(step)
         if a is None or b is None or a["outcome"] != b["outcome"]:
             failed_steps = True
             problems[step] = [f"outcome {a and a['outcome']} != {b and b['outcome']}: {(b or {}).get('message', '')[:600]}"]
     if failed_steps:
         return problems
-    live = [original["steps"]["orchestration.subscribeThread (live turn)"]["value"],
-            rust["steps"]["orchestration.subscribeThread (live turn)"]["value"]]
-    if live[0] is None or live[1] is None:
+    # A restart scenario reads the thread afterwards; nothing streamed live.
+    live = None if inspected else [original["steps"][live_step]["value"], rust["steps"][live_step]["value"]]
+    if live is None:
+        pass
+    elif live[0] is None or live[1] is None:
         problems["live"] = [f"run settled: original {live[0] is not None} rust {live[1] is not None}"]
     else:
         for reply in ("respondReply", "interruptReply"):
@@ -509,18 +602,25 @@ def provider_turns(args, credentials):
         with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
             temporary = Path(temporary)
             drivers = set() if scenario["scenario"] is None else {"codex" if scenario["instance"] == "codex" else "claude"}
-            write_fake_clis(temporary / "fake-bin", drivers)
-            path = os.pathsep.join([str(temporary / "fake-bin"), path_without(PROVIDER_CLIS | RELAY_TOOLS, temporary / "bin")])
             for name, command in (("original", shlex.split(args.original_command)),
                                   ("rust", shlex.split(args.rust_command))):
+                # Each server has its own fake CLIs, which a restart scenario may remove.
+                fake_bin = temporary / f"{name}-fake-bin"
+                write_fake_clis(fake_bin, drivers)
+                path = os.pathsep.join([str(fake_bin), path_without(PROVIDER_CLIS | RELAY_TOOLS, temporary / "bin")])
                 log = temporary / f"{name}-provider.log"
                 env = {**GIT_ISOLATION, "PATH": path, "FAKE_PROVIDER_CLI": str(FIXTURES / "fake_cli.py"),
                        "FAKE_PROVIDER_LOG": str(log),
                        "FAKE_PROVIDER_SCENARIO": str(FIXTURES / (scenario["scenario"] or "codex_turn.json"))}
                 root = temporary / name
-                url, cookie = managed_server(stack, command, root, *credentials, env=env)
-                seeded = seed_turn(url, cookie, temporary / f"{name}-checkouts", scenario)
-                outcomes[name] = run_client(args, url, cookie, seeded)
+                if "restart" in scenario:
+                    outcomes[name] = restart_turn(args, command, root, credentials, env,
+                                                  temporary / f"{name}-checkouts", fake_bin, scenario)
+                    outcomes[name]["launches"] = turn_launches(log)
+                else:
+                    url, cookie = managed_server(stack, command, root, *credentials, env=env)
+                    seeded = seed_turn(url, cookie, temporary / f"{name}-checkouts", scenario)
+                    outcomes[name] = run_client(args, url, cookie, seeded)
                 outcomes[name]["cli"] = cli_approvals(log)
                 outcomes[name]["launch"] = cli_launch(log, temporary)
         if args.dump:

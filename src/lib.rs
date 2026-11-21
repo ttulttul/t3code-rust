@@ -95,6 +95,7 @@ pub mod persistence;
 pub mod platform;
 mod provider_projection;
 mod provider_state;
+mod runtime_recovery;
 mod store;
 pub use store::*;
 pub(crate) use store::{now, CommandReceipt};

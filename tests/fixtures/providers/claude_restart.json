@@ -1,0 +1,11 @@
+{
+  "variants": [
+    {
+      "argsContain": "--resume",
+      "scenario": "claude_resume.json"
+    },
+    {
+      "scenario": "claude_interrupt.json"
+    }
+  ]
+}

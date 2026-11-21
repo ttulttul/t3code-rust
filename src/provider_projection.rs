@@ -83,6 +83,7 @@ fn failure_json(failure: &provider::ProviderFailure) -> Value {
 
 /// What the server says when a restart cut off the turn a request waited in.
 const RESTART_REASON: &str = "The server restarted before this runtime request was resolved.";
+const SHUTDOWN_REASON: &str = "The server shut down before this runtime request was resolved.";
 
 /// How a request stands, after a restart may have cut its turn off: its
 /// status, how it can be answered, and when it stopped waiting.
@@ -103,8 +104,13 @@ impl Thread {
         request: &RequestRecord,
         session_id: &Value,
     ) -> RequestState {
-        let restarted =
-            request.pending() && run.error.as_deref() == Some(crate::turn::RESTART_INTERRUPTION);
+        let restarted = request.pending()
+            && (run.restart_cut.is_some()
+                || run.error.as_deref() == Some(crate::turn::RESTART_INTERRUPTION));
+        let shut_down = run
+            .restart_cut
+            .as_ref()
+            .is_some_and(|cut| cut.trigger == "shutdown");
         if restarted && request.request.kind == "user_input" {
             return RequestState {
                 status: "pending",
@@ -114,8 +120,8 @@ impl Thread {
         }
         if restarted {
             return RequestState {
-                status: "expired",
-                capability: json!({"type": "not_resumable", "reason": RESTART_REASON}),
+                status: if shut_down { "cancelled" } else { "expired" },
+                capability: json!({"type": "not_resumable", "reason": if shut_down { SHUTDOWN_REASON } else { RESTART_REASON }}),
                 resolved_at: run.finished_at.or(Some(request.created_at)),
             };
         }
@@ -268,7 +274,7 @@ impl Thread {
                 "handoffIds": [],
                 "forkedFrom": null,
                 "pendingBackgroundTasks": [],
-                "contextUsage": null,
+                "contextUsage": self.context_usage(),
                 "nativeMetadata": self.claude_native_metadata(&thread.driver),
                 "goal": null,
                 "createdAt": iso(thread.created_at),
@@ -280,6 +286,30 @@ impl Thread {
         out.items
             .retain(|(_, item)| item.get("requestSlot").is_none());
         out
+    }
+
+    /// The provider thread's context usage, as the reference sets it when a
+    /// turn starts on a thread whose earlier turns reported usage: the
+    /// usage they reported last (`latestNativeContextUsage`).
+    fn context_usage(&self) -> Value {
+        let Some(last) = self
+            .runs
+            .iter()
+            .rposition(|run| self.provider.runs.contains_key(&run.id))
+        else {
+            return Value::Null;
+        };
+        self.runs[..last]
+            .iter()
+            .filter_map(|run| self.provider.runs.get(&run.id)?.usage.as_ref())
+            .max_by_key(|(_, at)| *at)
+            .map_or(Value::Null, |(usage, _)| {
+                let mut out = json!({"usedTokens": usage.used_tokens});
+                if let Some(max) = usage.max_tokens.filter(|max| *max > 0) {
+                    out["maxTokens"] = json!(max);
+                }
+                out
+            })
     }
 
     /// A Claude session's metadata: its title (the thread's) and what its
@@ -339,6 +369,8 @@ impl Thread {
             && last
                 .and_then(|t| t.failure.as_ref())
                 .is_some_and(|failure| failure.message == provider::CODEX_STREAM_CLOSED);
+        // A restart stops a session that has not failed.
+        let stopped = self.provider.session_stopped_at.filter(|_| !crashed);
         let capabilities: Value =
             serde_json::from_str(include_str!("provider_capabilities.json")).unwrap_or_default();
         let row = self.stored_row();
@@ -352,8 +384,8 @@ impl Thread {
             "lastError": if crashed { json!(provider::CODEX_STREAM_CLOSED) } else { Value::Null },
             "model": row["modelSelection"]["model"],
             "providerInstanceId": instance,
-            "status": if crashed { "error" } else { "ready" },
-            "updatedAt": iso(if crashed { thread.updated_at } else { thread.created_at })
+            "status": if crashed { "error" } else if stopped.is_some() { "stopped" } else { "ready" },
+            "updatedAt": iso(if crashed { thread.updated_at } else { stopped.unwrap_or(thread.created_at) })
         }))
     }
 
@@ -370,8 +402,17 @@ impl Thread {
         turn_ordinal: usize,
     ) {
         let driver = ids.driver.as_str();
-        let ended = terminal.map(|_| record.ended_at.unwrap_or(record.started_at));
+        // A turn a restart cut off before it ended is cancelled then.
+        let cut = run
+            .restart_cut
+            .as_ref()
+            .filter(|_| terminal.is_none())
+            .map(|cut| cut.at);
+        let ended = terminal
+            .map(|_| record.ended_at.unwrap_or(record.started_at))
+            .or(cut);
         let status = match terminal.map(|terminal| terminal.status) {
+            None if cut.is_some() => "cancelled",
             None | Some(TurnStatus::Running) => "running",
             Some(TurnStatus::Completed) => "completed",
             Some(TurnStatus::Interrupted) => "interrupted",
@@ -468,7 +509,7 @@ impl Thread {
                     .push((index, json!({"requestSlot": item.item.id})));
                 continue;
             }
-            self.provider_item(out, index, ids, item, terminal.map(|t| t.status));
+            self.provider_item(out, index, ids, item, terminal.map(|t| t.status), cut);
         }
         if let Some(plan) = &record.plan {
             let native = format!("turn-plan:{native_turn}");
@@ -537,6 +578,10 @@ impl Thread {
             out.items.push((index, item));
         }
 
+        if let Some(restart) = &run.restart_cut {
+            out.items
+                .push((index, self.restart_notice(run, restart, Some(ids))));
+        }
         let Some(terminal) = terminal else { return };
         let at = completed.clone().unwrap_or_else(|| started.clone());
         match terminal.status {
@@ -645,7 +690,39 @@ impl Thread {
             }
             TurnStatus::Completed | TurnStatus::Running => {}
         }
-        let _ = run;
+    }
+
+    /// The notice the reference adds to a run a restart cut off
+    /// (`server-recovery`), after the run's items.
+    pub(crate) fn restart_notice(
+        &self,
+        run: &Run,
+        restart: &crate::RestartCut,
+        ids: Option<&RunIds>,
+    ) -> Value {
+        let at = iso(restart.at);
+        let startup = restart.trigger == "startup";
+        json!({
+            "id": join("turn-item:run", &[&run.id.to_string()]) + ":signal:server-recovery",
+            "threadId": self.id,
+            "runId": run.id.to_string(),
+            "nodeId": ids.map(|ids| ids.root_node.clone()),
+            "providerThreadId": ids.map(|ids| ids.provider_thread.clone()),
+            "providerTurnId": null,
+            "nativeItemRef": null,
+            "parentItemId": null,
+            "ordinal": 0,
+            "status": "completed",
+            "title": if startup { "Server restarted" } else { "Server shut down" },
+            "startedAt": at,
+            "completedAt": at,
+            "updatedAt": at,
+            "type": "system_notice",
+            "message": format!(
+                "Cancelled because the server {} before the provider work completed.",
+                if startup { "restarted" } else { "shut down" }
+            )
+        })
     }
 
     /// A runtime request's record, node and turn item, as the reference's
@@ -843,6 +920,7 @@ impl Thread {
         ids: &RunIds,
         record: &ItemRecord,
         ended: Option<TurnStatus>,
+        cut: Option<u64>,
     ) {
         let driver = ids.driver.as_str();
         let item = &record.item;
@@ -862,6 +940,7 @@ impl Thread {
             ("running", Some(TurnStatus::Interrupted)) => "interrupted",
             ("running", Some(TurnStatus::Failed)) => "failed",
             ("running", Some(TurnStatus::Completed)) => "completed",
+            ("pending" | "running" | "waiting", None) if cut.is_some() => "cancelled",
             (status, _) => status,
         }
         .to_owned();
@@ -869,7 +948,9 @@ impl Thread {
         let node = item_id("node", driver, native);
         let reference = native_ref(driver, native, "strong");
         let started = iso(record.first_at);
-        let updated = iso(record.updated_at);
+        // An item a restart cancelled changed then.
+        let cancelled_at = cut.filter(|_| status == "cancelled" && item.status != "cancelled");
+        let updated = iso(cancelled_at.unwrap_or(record.updated_at));
         let completed = (!running).then(|| updated.clone());
         let mut row = Map::new();
         for (key, value) in [
@@ -1011,6 +1092,8 @@ mod tests {
             error: None,
             user_message_id: None,
             queue_held: false,
+            restart_cut: None,
+            restart_continuation_of: None,
         };
         let mut live = thread(run.clone());
         for event in [

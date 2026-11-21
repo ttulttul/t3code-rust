@@ -39,6 +39,11 @@ pub(crate) trait TurnHost:
     fn turn_recorded(&self, _run: &Run, _position: Option<StreamPosition>) {}
     /// The run has ended and its end is recorded.
     fn turn_finished(&self, _run: &Run) {}
+    /// The server is stopping: it has recorded how its turns were cut off,
+    /// so what they report from now on is not recorded.
+    fn stopping(&self) -> bool {
+        false
+    }
 }
 
 /// Start `spec` for `run` and record it until it ends, recording a failure
@@ -100,6 +105,9 @@ pub(crate) fn interrupted(run: &Run) -> Event {
 
 async fn fail<H: TurnHost>(host: &H, run: &Run, error: anyhow::Error) {
     host.cancellations().lock().await.remove(&run.id);
+    if host.stopping() {
+        return;
+    }
     match host
         .commit(Event::RunFinished {
             run_id: run.id,
@@ -178,6 +186,9 @@ async fn record<H: TurnHost>(
     };
     let mut exit = None;
     while let Some(TurnItem { event, position }) = turn.recv().await {
+        if host.stopping() {
+            return Ok(());
+        }
         match recorded(run, event, position) {
             Recorded::Event(event) => {
                 // An event that could not be recorded is not acknowledged,
@@ -208,6 +219,9 @@ async fn record<H: TurnHost>(
     else {
         anyhow::bail!("the provider process could not be waited for");
     };
+    if host.stopping() {
+        return Ok(());
+    }
     let thread_id = run.thread_id.clone();
     // A provider turn ends as its `turn.terminal` says, which may have been
     // recorded before a restart; a command turn as its process exited.

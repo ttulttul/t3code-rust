@@ -46,6 +46,24 @@ pub(crate) async fn dispatch_orchestration_command<H: CommandHost>(
     state: Arc<H>,
     command: Value,
 ) -> Result<u64, Value> {
+    dispatch_command(state, command, None).await
+}
+
+/// Dispatch the server's own `message.dispatch` that continues `source`, a
+/// run a restart cut off, with the checks a client's message gets.
+pub(crate) async fn dispatch_restart_continuation<H: CommandHost>(
+    state: Arc<H>,
+    command: Value,
+    source: Uuid,
+) -> Result<u64, Value> {
+    dispatch_command(state, command, Some(source)).await
+}
+
+async fn dispatch_command<H: CommandHost>(
+    state: Arc<H>,
+    command: Value,
+    continuation_of: Option<Uuid>,
+) -> Result<u64, Value> {
     let kind = command["type"].as_str().unwrap_or_default();
     let command_id = command["commandId"].as_str().unwrap_or_default();
     let id = command["threadId"]
@@ -230,7 +248,7 @@ pub(crate) async fn dispatch_orchestration_command<H: CommandHost>(
         command_id: command_id.to_string(),
         thread_id: id.to_string(),
     };
-    apply_command(state.clone(), &command, &receipt)
+    apply_command(state.clone(), &command, &receipt, continuation_of)
         .await
         .map_err(|e| dispatch_error(e.to_string()))
 }
@@ -282,6 +300,7 @@ async fn start_run<H: CommandHost>(
     text: String,
     message_id: &Value,
     queued: bool,
+    continues: Option<Uuid>,
 ) -> anyhow::Result<u64> {
     let (cwd, needs_baseline) = state
         .store
@@ -302,10 +321,18 @@ async fn start_run<H: CommandHost>(
         error: None,
         user_message_id: Some(message_id.as_str().unwrap_or_default().to_owned()),
         queue_held: queued,
+        restart_cut: None,
+        restart_continuation_of: continues,
     };
     let message = ConversationMessage {
         id: message_id.as_str().unwrap_or_default().to_owned(),
-        role: "user".into(),
+        // The prompt that continues a run shows as a notification.
+        role: if continues.is_some() {
+            crate::thread_projection::NOTIFICATION_ROLE
+        } else {
+            "user"
+        }
+        .into(),
         content: text.clone(),
         created_at: now(),
     };
@@ -412,6 +439,7 @@ async fn apply_command<H: CommandHost>(
     state: Arc<H>,
     command: &Value,
     receipt: &CommandReceipt,
+    continues: Option<Uuid>,
 ) -> anyhow::Result<u64> {
     let command_type = command
         .get("type")
@@ -492,6 +520,7 @@ async fn apply_command<H: CommandHost>(
                 text,
                 &command["messageId"],
                 queued,
+                continues,
             )
             .await;
         }

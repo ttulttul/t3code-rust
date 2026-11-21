@@ -62,8 +62,58 @@ pub struct AppState {
         Arc<crate::model_manifest::ModelManifest<crate::model_manifest::NativeHost>>,
     /// Background tasks, timers and the open sockets.
     pub(crate) runtime: Arc<crate::runtime::TokioRuntime>,
+    /// Set once the server starts to stop; see [`crate::turn::TurnHost::stopping`].
+    pub(crate) stopping: std::sync::atomic::AtomicBool,
 }
 impl AppState {
+    /// The server is stopping: record how its running turns are cut off,
+    /// then stop their CLIs, which do not outlive it.
+    pub(crate) async fn stop_provider_runtime(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let _guard = self.project_mutation_lock.lock().await;
+            reconcile_provider_runtime(&self.control, "shutdown").await;
+        }
+        for (_, cancel) in self.cancellations.lock().await.drain() {
+            let _ = cancel.send(());
+        }
+    }
+
+    /// Continue the turns a restart cut off, as the reference's
+    /// `provider-runtime.continue` effects do once the server is up.
+    pub(crate) async fn continue_restarted_runs(self: Arc<Self>) {
+        let settings = match self.settings.internal() {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(%error, "could not read settings to continue restarted turns");
+                return;
+            }
+        };
+        let commands = {
+            let store = self.store.read().await;
+            crate::runtime_recovery::continuations(
+                &store,
+                &settings,
+                &auth_service::iso(auth_service::now()),
+            )
+        };
+        for (source, command) in commands {
+            let thread_id = command["threadId"].as_str().unwrap_or_default().to_owned();
+            if let Err(error) =
+                crate::orchestration::dispatch_restart_continuation(self.clone(), command, source)
+                    .await
+            {
+                tracing::info!(
+                    %thread_id,
+                    source_run_id = %source,
+                    error = %error["message"],
+                    "orchestration-v2.restart-continuation.not-sent"
+                );
+            }
+        }
+    }
+
     /// The settings workspace method `method` takes, as configured now. Only
     /// the fields that method reads are filled in; reading them costs a
     /// settings load or a lock.
@@ -137,10 +187,7 @@ impl AppState {
             Box::new(event_log::NdjsonLog::open(dir.join("events.jsonl"))?);
         let control = crate::control_state::ControlState::open(auth, documents, log, &dir)?;
         // Turns run as this process's children, so none survives a restart.
-        let cut_off = crate::turn::running_runs(&control.store_now());
-        for (run, _) in cut_off {
-            control.commit_now(crate::turn::interrupted(&run))?;
-        }
+        reconcile_provider_runtime(&control, "startup").await;
         let (project_clone_events, _) = broadcast::channel(64);
         let local = Arc::new(crate::workspace::LocalWorkspace::new(
             dir.clone(),
@@ -180,6 +227,7 @@ impl AppState {
                 crate::model_manifest::NativeHost::new(&paths.state_dir, settings.clone()),
             )),
             runtime: Arc::default(),
+            stopping: Default::default(),
         }))
     }
 }
@@ -290,6 +338,28 @@ impl crate::turn::TurnHost for AppState {
     }
     fn cancellations(&self) -> &Mutex<HashMap<Uuid, oneshot::Sender<()>>> {
         &self.cancellations
+    }
+    fn stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Record a restart's reconciliation of every thread's provider runtime
+/// ([`crate::runtime_recovery::reconcile`]).
+async fn reconcile_provider_runtime(control: &crate::control_state::ControlState, trigger: &str) {
+    let events = {
+        let store = control.store.read().await;
+        crate::runtime_recovery::reconcile(
+            &store,
+            trigger,
+            crate::now(),
+            &auth_service::iso(auth_service::now()),
+        )
+    };
+    for event in events {
+        if let Err(error) = control.commit(event).await {
+            tracing::error!(%error, trigger, "could not record a provider runtime reconciliation");
+        }
     }
 }
 
@@ -896,8 +966,11 @@ where
             tokio::join!(recoveries, startup);
         })
     });
+    // Continue what the last restart cut off, now that clients can watch it.
+    tokio::spawn(state.clone().continue_restarted_runs());
     let (stopping_tx, stopping_rx) = oneshot::channel::<()>();
     let stopping_endpoint = endpoint.clone();
+    let stopping_state = state.clone();
     let server = axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -905,6 +978,7 @@ where
     .with_graceful_shutdown(async move {
         shutdown.await;
         info!("shutting down t3code server");
+        stopping_state.stop_provider_runtime().await;
         stopping_endpoint.begin_shutdown();
         let _ = stopping_tx.send(());
     });

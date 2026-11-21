@@ -44,7 +44,14 @@ async fn a_restart_ends_runs_it_cut_off() {
     }
     let state = open(&paths).await;
     let store = state.store_now();
-    let ended = &store.threads["t1"].runs[0];
-    assert_eq!(ended.status, "failed");
-    assert!(ended.error.as_deref().unwrap().contains("restarted"));
+    let thread = &store.threads["t1"];
+    let ended = &thread.runs[0];
+    // As the reference's startup reconciliation ends them: cancelled, with a
+    // notice that the server restarted.
+    assert_eq!(ended.status, "cancelled");
+    let cut = ended.restart_cut.as_ref().unwrap();
+    assert_eq!(cut.trigger, "startup");
+    // It ran no provider turn, so there is nothing to continue.
+    assert_eq!(cut.continuation, None);
+    assert_eq!(ended.error, None);
 }

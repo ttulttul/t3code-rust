@@ -163,6 +163,9 @@ impl<'a> Attempt<'a> {
         // Requests the CLI does not settle itself come to us in every mode,
         // as the reference installs its permission callback.
         args.push("--permission-prompt-tool=stdio".into());
+        if let Some(resume) = resume {
+            args.push(format!("--resume={resume}"));
+        }
         args.push("--tools=default".into());
         args.push(format!("--permission-mode={mode}"));
         if mode == "bypassPermissions" {
@@ -173,9 +176,7 @@ impl<'a> Attempt<'a> {
         for dir in &provider.extra_dirs {
             args.push(format!("--add-dir={dir}"));
         }
-        if let Some(resume) = resume {
-            args.push(format!("--resume={resume}"));
-        } else {
+        if resume.is_none() {
             // The reference picks a new session's id itself, so the thread
             // names its session even if the CLI never starts.
             let session = uuid::Uuid::new_v4().to_string();
@@ -211,10 +212,9 @@ impl<'a> Attempt<'a> {
         if !provider.app_thread_id.is_empty() {
             extra_env.push(("T3CODE_THREAD_ID".into(), provider.app_thread_id.clone()));
         }
-        if resume.is_some() {
-            extra_env.push(("CLAUDE_CODE_RESUME_INTERRUPTED_TURN".into(), "1".into()));
-            extra_env.push(("CLAUDE_CODE_RESUME_REASON".into(), "user_resume".into()));
-        }
+        // The reference marks only a turn that resumes an interrupted one
+        // without a prompt (`resumeTurn`), which this server does not send;
+        // a turn in a resumed session is not marked.
         let cli = match Cli::spawn(
             spec,
             Launch {

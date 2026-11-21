@@ -27,6 +27,9 @@ pub struct ProviderState {
     /// What the native session's prompts used of its attachment budget
     /// (bytes, pages), once a prompt reached it.
     pub attachment_budget: Option<(u64, u64)>,
+    /// When a server restart stopped the provider session, until a turn
+    /// starts it again.
+    pub session_stopped_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -119,6 +122,8 @@ pub struct PlanRecord {
 impl ProviderState {
     /// Apply `run`'s provider `event`, recorded at `at` (seconds).
     pub(crate) fn apply(&mut self, run: Uuid, event: &ProviderEvent, at: u64) {
+        // A turn after a restart runs in a session started again.
+        self.session_stopped_at = None;
         let driver = match event {
             ProviderEvent::ProviderThread { driver, .. } => driver.clone(),
             _ => self
@@ -344,6 +349,22 @@ impl ProviderState {
             }
             ProviderEvent::CommandOutputDelta { .. } | ProviderEvent::RuntimeRequest { .. } => {}
         }
+    }
+
+    /// A server restart stopped the provider session at `at`: no CLI
+    /// survives the server, so an active provider thread is idle.
+    pub(crate) fn stop_session(&mut self, at: u64) {
+        self.session_stopped_at = Some(at);
+        if let Some(thread) = self.thread.as_mut().filter(|t| t.status == "active") {
+            thread.status = "idle";
+            thread.updated_at = at;
+        }
+    }
+
+    /// Whether the thread's provider session is open: a turn opened it and
+    /// no restart stopped it since.
+    pub fn session_live(&self) -> bool {
+        self.thread.is_some() && self.session_stopped_at.is_none()
     }
 
     /// The run and record of the request `id`.

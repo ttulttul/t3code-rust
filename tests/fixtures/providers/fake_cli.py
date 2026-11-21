@@ -9,7 +9,9 @@ arguments and launch environment as JSON to FAKE_PROVIDER_LOG.launch.
 
 A scenario is {"steps": [...]} or {"variants": [{"argsContain": "...",
 "steps": [...]}, ...]}, where the first variant whose argsContain is in the
-arguments (or that has none) plays. Steps:
+arguments (or that has none) plays. A variant may name another scenario file
+in this directory ("scenario": "claude_turn.json") to play its steps instead.
+Steps:
 
   {"expect": "turn/start"}   read until a message whose method, type or
                              request.subtype matches; remember it
@@ -44,11 +46,19 @@ with open(os.environ["FAKE_PROVIDER_SCENARIO"]) as source:
     scenario = json.load(source)
 
 if "variants" in scenario:
-    steps = next(
-        v["steps"]
+    variant = next(
+        v
         for v in scenario["variants"]
         if "argsContain" not in v or v["argsContain"] in " ".join(args)
     )
+    if "scenario" in variant:
+        directory = os.path.dirname(os.path.abspath(os.environ["FAKE_PROVIDER_SCENARIO"]))
+        with open(os.path.join(directory, variant["scenario"])) as source:
+            played = json.load(source)
+        steps = played["steps"]
+        scenario = {**played, **{k: v for k, v in scenario.items() if k != "variants"}}
+    else:
+        steps = variant["steps"]
 else:
     steps = scenario["steps"]
 

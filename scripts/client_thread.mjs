@@ -277,13 +277,16 @@ const program = Effect.gen(function* () {
   });
   yield* session.ready;
   const client = session.client;
-  if (seed.dispatch) {
+  if (seed.dispatch || seed.inspect) {
     // A provider turn: subscribe first, dispatch the message once synchronized, and keep what
-    // streams in until the run settles (or the wait ends). Then read the thread afresh.
-    yield* record(
-      "orchestration.subscribeThread (live turn)",
-      liveTurn(client, seed).pipe(Effect.timeoutOption(seed.turnMs ?? 30000), Effect.map(Option.getOrNull)),
-    );
+    // streams in until the run settles (or the wait ends). Then read the thread afresh. With
+    // `seed.inspect` (a thread whose turns already ran), only read it.
+    if (seed.dispatch) {
+      yield* record(
+        "orchestration.subscribeThread (live turn)",
+        liveTurn(client, seed).pipe(Effect.timeoutOption(seed.turnMs ?? 30000), Effect.map(Option.getOrNull)),
+      );
+    }
     yield* record("orchestration.subscribeThread", untilSynchronized(client["orchestration.subscribeThread"](threadInput(seed.threadId))));
     yield* record("orchestration.getThreadProjection", client["orchestration.getThreadProjection"]({ threadId: seed.threadId }));
     // What a client fetches for each item whose output the projection left out.

@@ -38,6 +38,12 @@ fn merge(target: &mut Value, fields: Value) {
     }
 }
 
+/// The role of a message the server sent as a notification: the prompt that
+/// continues a run a restart cut off.
+pub(crate) const NOTIFICATION_ROLE: &str = "notification";
+/// The notification's summary, as the reference words it.
+pub(crate) const RESTART_CONTINUATION_SUMMARY: &str = "T3 Code restarted and resumed this turn";
+
 /// The reference's run statuses; older stores can hold others.
 fn run_status(status: &str) -> &'static str {
     match status {
@@ -183,6 +189,10 @@ impl Thread {
                     out["rootNodeId"] = json!(ids.root_node);
                     out["activeAttemptId"] = json!(ids.attempt);
                 }
+                if let Some(source) = run.restart_continuation_of {
+                    out["restartContinuationOfRunId"] = json!(source.to_string());
+                    out["workStartedAt"] = json!(iso(self.work_started_at(run)));
+                }
                 if status == "queued" {
                     queue_position += 1;
                     out["queuePosition"] = json!(queue_position);
@@ -191,6 +201,22 @@ impl Thread {
                 out
             })
             .collect()
+    }
+
+    /// When the work `run` continues began: the start of the first run of
+    /// its chain of restart continuations.
+    fn work_started_at(&self, run: &crate::Run) -> u64 {
+        let mut current = run;
+        for _ in 0..self.runs.len() {
+            let Some(source) = current
+                .restart_continuation_of
+                .and_then(|id| self.runs.iter().find(|r| r.id == id))
+            else {
+                break;
+            };
+            current = source;
+        }
+        current.started_at
     }
 
     fn run_of(&self, message_id: &str) -> Option<(usize, &crate::Run)> {
@@ -204,6 +230,8 @@ impl Thread {
     fn message_rows(&self) -> Vec<Value> {
         self.messages
             .iter()
+            // A notification shows as its turn item only.
+            .filter(|message| message.role != NOTIFICATION_ROLE)
             .map(|message| {
                 let at = iso(message.created_at);
                 json!({
@@ -289,6 +317,20 @@ impl Thread {
                     "text": message.content,
                     "streaming": false
                 }),
+                // The prompt that continues a run a restart cut off.
+                NOTIFICATION_ROLE => {
+                    if let Some(ids) = run.and_then(|(_, run)| self.provider_run_ids(run)) {
+                        item["nodeId"] = json!(ids.root_node);
+                        item["providerThreadId"] = json!(ids.provider_thread);
+                    }
+                    json!({
+                        "type": "notification",
+                        "source": {"kind": "system"},
+                        "outcome": "updated",
+                        "summary": RESTART_CONTINUATION_SUMMARY,
+                        "detail": message.content
+                    })
+                }
                 _ => continue,
             };
             merge(&mut item, fields);
@@ -296,6 +338,16 @@ impl Thread {
             let Some((_, run)) = run else { continue };
             // A provider turn's end adds its own items.
             if self.provider.terminals.contains_key(&run.id) {
+                continue;
+            }
+            // So does a provider turn a restart cut off.
+            if let Some(restart) = &run.restart_cut {
+                if !self.provider.runs.contains_key(&run.id) {
+                    ordinal += 1;
+                    let mut notice = self.restart_notice(run, restart, None);
+                    notice["ordinal"] = json!(ordinal);
+                    items.push(notice);
+                }
                 continue;
             }
             let Some(error) = run

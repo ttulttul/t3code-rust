@@ -36,6 +36,28 @@ pub struct Run {
     pub user_message_id: Option<String>,
     #[serde(default)]
     pub queue_held: bool,
+    /// How a server restart cut the run off, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_cut: Option<RestartCut>,
+    /// The run a restart cut off that this run continues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_continuation_of: Option<Uuid>,
+}
+
+/// A run that a server restart cut off, as the reference's
+/// ProviderRuntimeRecoveryService reconciles it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestartCut {
+    /// The reconcile's trigger: `shutdown` (the server stopped) or `startup`
+    /// (it started again after stopping without one).
+    pub trigger: String,
+    /// When it was cut off (seconds).
+    pub at: u64,
+    /// When the run's turn should continue after the restart: how many
+    /// processes in a row ended under it (the reference's
+    /// `processLossCount`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -147,6 +169,15 @@ pub enum Event {
     ThreadDeleted {
         thread_id: String,
     },
+    /// A server restart's reconciliation of a thread's provider runtime: the
+    /// running runs it cut off end cancelled, the queued ones wait to be
+    /// sent, and the provider session stops.
+    ProviderRuntimeReconciled {
+        thread_id: String,
+        cut: Vec<(Uuid, RestartCut)>,
+        #[serde(default)]
+        held: Vec<Uuid>,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServerEvent {
@@ -173,7 +204,8 @@ impl Event {
             | Event::RunProvider { thread_id, .. }
             | Event::RunFinished { thread_id, .. }
             | Event::CheckpointCaptured { thread_id, .. }
-            | Event::ThreadPatched { thread_id, .. } => Some(thread_id),
+            | Event::ThreadPatched { thread_id, .. }
+            | Event::ProviderRuntimeReconciled { thread_id, .. } => Some(thread_id),
             Event::RunStarted(run) | Event::RunUpdated(run) | Event::RunQueued { run, .. } => {
                 Some(&run.thread_id)
             }
@@ -413,6 +445,31 @@ impl Store {
             Event::ThreadDeleted { thread_id } => {
                 self.threads.remove(thread_id);
                 self.deleted_thread_ids.insert(thread_id.clone());
+            }
+            Event::ProviderRuntimeReconciled {
+                thread_id,
+                cut,
+                held,
+            } => {
+                for (run_id, _) in cut {
+                    self.turn_positions.remove(run_id);
+                }
+                if let Some(thread) = self.threads.get_mut(thread_id) {
+                    for (run_id, restart) in cut {
+                        if let Some(run) = thread.runs.iter_mut().find(|r| r.id == *run_id) {
+                            run.status = "cancelled".into();
+                            run.finished_at = Some(restart.at);
+                            run.restart_cut = Some(restart.clone());
+                        }
+                    }
+                    for run in thread.runs.iter_mut().filter(|r| held.contains(&r.id)) {
+                        run.queue_held = true;
+                    }
+                    if !cut.is_empty() {
+                        thread.status = "cancelled".into();
+                    }
+                    thread.provider.stop_session(at);
+                }
             }
         }
     }
